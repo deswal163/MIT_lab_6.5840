@@ -1,12 +1,17 @@
+//go:build ignore
+
 package main
 
 //
 // see comments in lockd.go
 //
 
-import "6.5840/lockservice"
-import "os"
-import "fmt"
+import (
+	"fmt"
+	"os"
+
+	"6.5840/lockservice"
+)
 
 func usage() {
 	fmt.Printf("Usage: lockc -l|-u primaryport backupport lockname\n")

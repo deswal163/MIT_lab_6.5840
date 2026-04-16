@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -5,7 +7,7 @@ import (
 	"os"
 
 	"6.5840/shardkv1/shardgrp"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 func main() {

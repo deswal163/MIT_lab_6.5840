@@ -1,13 +1,18 @@
+//go:build ignore
+
 package main
 
 //
 // see directions in pbc.go
 //
 
-import "time"
-import "6.5840/pbservice"
-import "os"
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"6.5840/pbservice"
+)
 
 func main() {
 	if len(os.Args) != 3 {

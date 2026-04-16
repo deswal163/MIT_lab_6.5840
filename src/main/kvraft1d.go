@@ -1,11 +1,13 @@
+//go:build ignore
+
 package main
 
 import (
 	"fmt"
 	"os"
 
-	"6.5840/kvraft1"
-	"6.5840/tester1"
+	kvraft "6.5840/kvraft1"
+	tester "6.5840/tester1"
 )
 
 func main() {

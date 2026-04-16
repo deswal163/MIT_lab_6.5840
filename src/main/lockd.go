@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 // export GOPATH=~/6.5840
@@ -11,10 +13,13 @@ package main
 // on Athena, use /tmp/myname-a and /tmp/myname-b
 // instead of a and b.
 
-import "time"
-import "6.5840/lockservice"
-import "os"
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"6.5840/lockservice"
+)
 
 func main() {
 	if len(os.Args) == 4 && os.Args[1] == "-p" {

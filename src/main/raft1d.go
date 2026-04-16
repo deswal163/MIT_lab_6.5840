@@ -1,11 +1,13 @@
+//go:build ignore
+
 package main
 
 import (
 	"fmt"
 	"os"
 
-	"6.5840/raft1"
-	"6.5840/tester1"
+	raft "6.5840/raft1"
+	tester "6.5840/tester1"
 )
 
 func main() {
