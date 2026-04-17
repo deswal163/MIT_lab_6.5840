@@ -1,3 +1,9 @@
+// Package mr implements a simple MapReduce coordinator.
+//
+// Coordinator state (phase, map/reduce tasks) is owned by a single goroutine
+// (coordinatorLoop). RPC handlers do not touch that state directly; they send
+// requests on channels and block on reply channels. Timeouts are handled in the
+// same loop via a ticker—one place to read for the job lifecycle.
 package mr
 
 import (
@@ -7,11 +13,8 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
-	"sync"
 	"time"
 )
-
-var nRD int
 
 type Task struct {
 	TaskID        int
@@ -20,11 +23,32 @@ type Task struct {
 	taskStartTime time.Time
 }
 
+// askTaskReq is a request from an RPC handler to the state loop: please fill reply.
+type askTaskReq struct {
+	reply chan<- AskTaskReply
+}
+
+// taskDoneReq reports completion of a task to the state loop.
+type taskDoneReq struct {
+	args  TaskDoneArgs
+	reply chan<- struct{}
+}
+
+// doneQueryReq asks whether the whole job is finished (mrcoordinator polls this).
+type doneQueryReq struct {
+	reply chan<- bool
+}
+
 type Coordinator struct {
-	mu          sync.Mutex
+	nReduce int
+
 	MapTasks    []*Task
 	ReduceTasks []*Task
 	phase       string
+
+	askCh       chan askTaskReq
+	taskDoneCh  chan taskDoneReq
+	doneQueryCh chan doneQueryReq
 }
 
 func checkAllTaskDone(tasks []*Task) bool {
@@ -36,44 +60,47 @@ func checkAllTaskDone(tasks []*Task) bool {
 	return true
 }
 
-func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *Coordinator) AskTask(_ *AskTaskArgs, reply *AskTaskReply) error {
+	replyCh := make(chan AskTaskReply, 1)
+	c.askCh <- askTaskReq{reply: replyCh}
+	*reply = <-replyCh
+	return nil
+}
 
+func (c *Coordinator) handleAskTask() AskTaskReply {
+	var reply AskTaskReply
 	switch c.phase {
 	case "Map":
 		for index, task := range c.MapTasks {
 			if task.TaskState == "Idle" {
-				reply.NReduce = nRD
+				reply.NReduce = c.nReduce
 				reply.TaskAvailable = 1
 				reply.TaskID = index
 				reply.TaskFile = task.TaskFile
 				reply.TaskType = "map"
 				task.TaskState = "InProgress"
 				task.taskStartTime = time.Now()
-				return nil
+				return reply
 			}
 		}
 	case "Reduce":
 		for index, task := range c.ReduceTasks {
 			if task.TaskState == "Idle" {
-				reply.NReduce = nRD
+				reply.NReduce = c.nReduce
 				reply.TaskAvailable = 1
 				reply.TaskID = index
 				reply.TaskType = "reduce"
 				task.TaskState = "InProgress"
 				task.taskStartTime = time.Now()
-				return nil
+				return reply
 			}
 		}
 	case "Done":
 		reply.TaskType = "done"
 		reply.TaskAvailable = 1
-		return nil
+		return reply
 	}
-
-	// create ReduceTasks
-	return nil
+	return reply
 }
 
 func processMapTaskDone(c *Coordinator, args *TaskDoneArgs, _ *TaskDoneReply) error {
@@ -87,7 +114,6 @@ func processMapTaskDone(c *Coordinator, args *TaskDoneArgs, _ *TaskDoneReply) er
 }
 
 func processReduceTaskDone(c *Coordinator, args *TaskDoneArgs, _ *TaskDoneReply) error {
-
 	task := c.ReduceTasks[args.TaskID]
 
 	if task.TaskState != "Done" {
@@ -98,7 +124,7 @@ func processReduceTaskDone(c *Coordinator, args *TaskDoneArgs, _ *TaskDoneReply)
 }
 
 func createReduceTasks(c *Coordinator) {
-	for i := range nRD {
+	for i := 0; i < c.nReduce; i++ {
 		c.ReduceTasks = append(c.ReduceTasks, &Task{
 			TaskID:    i,
 			TaskState: "Idle",
@@ -106,10 +132,7 @@ func createReduceTasks(c *Coordinator) {
 	}
 }
 
-func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+func (c *Coordinator) handleTaskDone(args *TaskDoneArgs, reply *TaskDoneReply) {
 	switch args.TaskType {
 	case "map":
 		if err := processMapTaskDone(c, args, reply); err != nil {
@@ -129,7 +152,12 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
 			c.phase = "Done"
 		}
 	}
+}
 
+func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
+	done := make(chan struct{}, 1)
+	c.taskDoneCh <- taskDoneReq{args: *args, reply: done}
+	<-done
 	return nil
 }
 
@@ -148,13 +176,9 @@ func (c *Coordinator) server(sockname string) {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.phase != "Done" {
-		return false
-	}
-	return true
+	replyCh := make(chan bool, 1)
+	c.doneQueryCh <- doneQueryReq{reply: replyCh}
+	return <-replyCh
 }
 
 func createTask(c *Coordinator, files []string) {
@@ -183,15 +207,28 @@ func checkFailureTasks(tasks []*Task) {
 	}
 }
 
-func checkForTimeOuts(c *Coordinator) error {
+// coordinatorLoop is the only goroutine that mutates phase and task slices.
+func (c *Coordinator) coordinatorLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 
+	var reply TaskDoneReply
 	for {
-		time.Sleep(2 * time.Second)
+		select {
+		case req := <-c.askCh:
+			req.reply <- c.handleAskTask()
 
-		c.mu.Lock()
-		checkFailureTasks(c.MapTasks)
-		checkFailureTasks(c.ReduceTasks)
-		c.mu.Unlock()
+		case req := <-c.taskDoneCh:
+			c.handleTaskDone(&req.args, &reply)
+			req.reply <- struct{}{}
+
+		case req := <-c.doneQueryCh:
+			req.reply <- (c.phase == "Done")
+
+		case <-ticker.C:
+			checkFailureTasks(c.MapTasks)
+			checkFailureTasks(c.ReduceTasks)
+		}
 	}
 }
 
@@ -199,13 +236,16 @@ func checkForTimeOuts(c *Coordinator) error {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
-	c := Coordinator{
-		phase: "Map",
+	c := &Coordinator{
+		phase:       "Map",
+		nReduce:     nReduce,
+		askCh:       make(chan askTaskReq),
+		taskDoneCh:  make(chan taskDoneReq),
+		doneQueryCh: make(chan doneQueryReq),
 	}
 
-	nRD = nReduce
-	createTask(&c, files)
-	go checkForTimeOuts(&c)
+	createTask(c, files)
+	go c.coordinatorLoop()
 	c.server(sockname)
-	return &c
+	return c
 }
