@@ -1,34 +1,61 @@
 package lock
 
 import (
-	"6.5840/kvtest1"
+	"time"
+
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
 )
 
 type Lock struct {
-	// IKVClerk is a go interface for k/v clerks: the interface hides
-	// the specific Clerk type of ck but promises that ck supports
-	// Put and Get.  The tester passes the clerk in when calling
-	// MakeLock().
-	ck kvtest.IKVClerk
-	// You may add code here
+	lockname string
+	ck       kvtest.IKVClerk
+	clientID string
 }
 
-// The tester calls MakeLock() and passes in a k/v clerk; your code can
-// perform a Put or Get by calling lk.ck.Put() or lk.ck.Get().
-//
-// This interface supports multiple locks by means of the
-// lockname argument; locks with different names should be
-// independent.
 func MakeLock(ck kvtest.IKVClerk, lockname string) *Lock {
-	lk := &Lock{ck: ck}
-	// You may add code here
+	clientID := kvtest.RandValue(8)
+	lk := &Lock{
+		ck:       ck,
+		lockname: lockname,
+		clientID: clientID,
+	}
+
 	return lk
 }
 
 func (lk *Lock) Acquire() {
-	// Your code here
+	for {
+		lockClientID, lockVersion, err := lk.ck.Get(lk.lockname)
+		if err == rpc.OK || err == rpc.ErrNoKey {
+			if lockClientID != "" && lockClientID != lk.clientID {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			ok := lk.ck.Put(lk.lockname, lk.clientID, lockVersion)
+			if ok != rpc.OK {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (lk *Lock) Release() {
-	// Your code here
+	for {
+		_, lockVersion, err := lk.ck.Get(lk.lockname)
+		if err != rpc.OK {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		ok := lk.ck.Put(lk.lockname, "", lockVersion)
+		if ok != rpc.OK && ok != rpc.ErrNoKey {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		return
+	}
+
 }
