@@ -18,22 +18,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+// keyValue is the per-key state stored in the server. The key itself is
+// implicit in the map index and therefore not repeated here.
 type keyValue struct {
-	key     string
 	value   string
 	version rpc.Tversion
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	kvStore map[string]*keyValue
+	mu    sync.Mutex
+	store map[string]keyValue
 }
 
 func MakeKVServer() *KVServer {
-	kv := &KVServer{}
-	// Your code here.
-	kv.kvStore = make(map[string]*keyValue)
-	return kv
+	return &KVServer{
+		store: make(map[string]keyValue),
+	}
 }
 
 // Get returns the value and version for args.Key, if args.Key
@@ -42,47 +42,41 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	value, exist := kv.kvStore[args.Key]
-
-	if !exist {
+	entry, ok := kv.store[args.Key]
+	if !ok {
 		reply.Err = rpc.ErrNoKey
 		return
 	}
 
-	reply.Value = value.value
-	reply.Version = value.version
+	reply.Value = entry.value
+	reply.Version = entry.version
 	reply.Err = rpc.OK
 }
 
-// Update the value for a key if args.Version matches the version of
-// the key on the server. If versions don't match, return ErrVersion.
-// If the key doesn't exist, Put installs the value if the
-// args.Version is 0, and returns ErrNoKey otherwise.
+// Put installs args.Value for args.Key if args.Version matches the
+// server's current version for that key, and increments the stored
+// version on success. If the key doesn't exist, Put installs the value
+// only when args.Version is 0; otherwise it returns ErrNoKey. A version
+// mismatch returns ErrVersion.
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	record, exist := kv.kvStore[args.Key]
-
-	if !exist {
+	entry, exists := kv.store[args.Key]
+	if !exists {
 		if args.Version != 0 {
 			reply.Err = rpc.ErrNoKey
 			return
 		}
-
-		record = &keyValue{
-			key: args.Key,
-		}
-	}
-
-	if args.Version != record.version {
+	} else if args.Version != entry.version {
 		reply.Err = rpc.ErrVersion
 		return
 	}
 
-	record.value = args.Value
-	record.version += 1
-	kv.kvStore[args.Key] = record
+	kv.store[args.Key] = keyValue{
+		value:   args.Value,
+		version: entry.version + 1,
+	}
 	reply.Err = rpc.OK
 }
 
