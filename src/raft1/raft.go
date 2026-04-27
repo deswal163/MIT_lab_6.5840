@@ -20,27 +20,40 @@ import (
 )
 
 const (
-	leader = iota
+	follower = iota
 	candidate
-	follower
+	leader
 )
 
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
 // A Go object implementing a single Raft peer.
+// CurrentTerm and VotedFor are exported for labgob persistence in 3C.
+// All other fields are in-memory only.
 type Raft struct {
-	mu            sync.Mutex          // Lock to protect shared access to this peer's state
-	peers         []*labrpc.ClientEnd // RPC end points of all peers
-	persister     *tester.Persister   // Object to hold this peer's persisted state
-	me            int                 // this peer's index into peers[]
-	CurrentTerm   int
-	VotedFor      int
-	leaderId      int
-	state         int
-	lastHeartBeat time.Time
+	mu               sync.Mutex          // Lock to protect shared access to this peer's state
+	peers            []*labrpc.ClientEnd // RPC end points of all peers
+	persister        *tester.Persister   // Object to hold this peer's persisted state
+	me               int                 // this peer's index into peers[]
+	CurrentTerm      int
+	VotedFor         int
+	leaderId         int
+	state            int
+	lastHeartBeat    time.Time
+	electionDeadline time.Time
 	// logs
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+}
+
+func (rf *Raft) updateHeartBeat() {
+	rf.lastHeartBeat = time.Now()
+	rf.electionDeadline = time.Now().Add(generateRandomTimeout())
 }
 
 // return currentTerm and whether this server
@@ -138,15 +151,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Term = rf.CurrentTerm
-
-	if args.Term <= rf.CurrentTerm {
-		if rf.VotedFor != -1 {
-			return
-		}
+	if rf.CurrentTerm < args.Term {
+		rf.state = follower
+		rf.CurrentTerm = args.Term
+		rf.VotedFor = -1
 	}
 
+	reply.Term = rf.CurrentTerm
+
+	if args.Term < rf.CurrentTerm || (rf.VotedFor != -1 && rf.VotedFor != args.CandidateId) {
+		reply.VoteGranted = false
+		return
+	}
+
+	rf.VotedFor = args.CandidateId
+	rf.state = follower
 	reply.VoteGranted = true
+	rf.updateHeartBeat()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -191,7 +212,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []raftapi.ApplyMsg
+	Entries      []LogEntry
 	LeaderCommit int
 }
 
@@ -211,62 +232,63 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// Heartbeat Request with higher or equal term
-	if len(args.Entries) == 0 {
+	rf.leaderId = args.LeaderId
+	rf.state = follower
+	rf.updateHeartBeat()
 
-		rf.leaderId = args.LeaderId
-		rf.state = follower
-		rf.lastHeartBeat = time.Now()
-
-		if args.Term > rf.CurrentTerm {
-			rf.CurrentTerm = args.Term
-			rf.VotedFor = -1
-		}
-
-		reply.Success = true
-		return
+	if args.Term > rf.CurrentTerm {
+		rf.CurrentTerm = args.Term
+		rf.VotedFor = -1
 	}
 
+	reply.Term = rf.CurrentTerm
+	reply.Success = true
 }
 
 func (rf *Raft) sendHeartBeats() {
 
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
+	for {
+		rf.mu.Lock()
+		if rf.state != leader {
+			rf.mu.Unlock()
+			return
 		}
 
-		go func(i int) {
-			rf.mu.Lock()
-			args := AppendEntriesArgs{
-				Term:     rf.CurrentTerm,
-				LeaderId: rf.me,
-				// PrevLogIndex: 0,
-				// PrevLogTerm: 0,
-				Entries: nil,
-				// LeaderCommit: 0,
-			}
-			rf.mu.Unlock()
-
-			reply := AppendEntriesReply{}
-
-			ok := rf.sendAppendEntries(i, &args, &reply)
-
-			if !ok {
-				return
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
 			}
 
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
+			go func(i, currentTerm, leaderId int) {
+				args := AppendEntriesArgs{
+					Term:     currentTerm,
+					LeaderId: leaderId,
+					Entries:  nil,
+				}
 
-			if reply.Term > rf.CurrentTerm {
-				rf.CurrentTerm = reply.Term
-				rf.state = follower
-				rf.VotedFor = -1
-				rf.lastHeartBeat = time.Now()
-			}
+				reply := AppendEntriesReply{}
 
-		}(i)
+				ok := rf.sendAppendEntries(i, &args, &reply)
+
+				if !ok {
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				if reply.Term > rf.CurrentTerm {
+					rf.CurrentTerm = reply.Term
+					rf.state = follower
+					rf.VotedFor = -1
+					rf.updateHeartBeat()
+				}
+
+			}(i, rf.CurrentTerm, rf.me)
+		}
+
+		rf.mu.Unlock()
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -292,26 +314,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func generateRandomTimeout() time.Duration {
-	return time.Duration((300 + rand.Int63()%200) * int64(time.Millisecond))
+	return time.Duration((300 + rand.Intn(200)) * int(time.Millisecond))
 }
 
-func (rf *Raft) startElection() {
+func (rf *Raft) startElection(currentTerm, me int) {
 
+	// votesReceived is accessed only under rf.mu; do not replace with atomic.
 	votesReceived := 1
-	savedCurrentTerm := rf.CurrentTerm
+	savedCurrentTerm := currentTerm
 
 	for i := range rf.peers {
-		if i == rf.me {
+		if i == me {
 			continue
 		}
 
-		go func(i int) {
-			rf.mu.Lock()
+		go func(i, currentTerm, candidateId int) {
 			args := RequestVoteArgs{
-				Term:        rf.CurrentTerm,
-				CandidateId: rf.me,
+				Term:        currentTerm,
+				CandidateId: candidateId,
 			}
-			rf.mu.Unlock()
 
 			reply := RequestVoteReply{}
 
@@ -331,45 +352,43 @@ func (rf *Raft) startElection() {
 				rf.CurrentTerm = reply.Term
 				rf.state = follower
 				rf.VotedFor = -1
+				rf.updateHeartBeat()
 			} else if reply.VoteGranted {
 
 				votesReceived++
 				if votesReceived > len(rf.peers)/2 {
 					rf.state = leader
 					rf.leaderId = rf.me
-					rf.sendHeartBeats()
+					go rf.sendHeartBeats()
 				}
 			}
 
-		}(i)
+		}(i, rf.CurrentTerm, rf.me)
 	}
 }
 
 func (rf *Raft) ticker() {
-	for true {
-
-		randomTimeOut := generateRandomTimeout()
+	for {
+		electionTimeout := false
+		var currentTerm, me int
 
 		rf.mu.Lock()
-		if rf.state != leader {
-			if time.Now().After(rf.lastHeartBeat.Add(randomTimeOut)) {
+		if time.Now().After(rf.electionDeadline) {
+			if rf.state != leader {
 				rf.state = candidate
 				rf.CurrentTerm++
 				rf.VotedFor = rf.me
-				rf.lastHeartBeat = time.Now()
+				rf.updateHeartBeat()
 
-				rf.startElection()
+				currentTerm, me = rf.CurrentTerm, rf.me
+				electionTimeout = true
 			}
-		} else {
-			rf.sendHeartBeats()
 		}
 		rf.mu.Unlock()
+		if electionTimeout {
+			rf.startElection(currentTerm, me)
+		}
 
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -396,7 +415,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.CurrentTerm = 0
 	rf.VotedFor = -1
 	rf.state = follower
-	rf.lastHeartBeat = time.Now()
+	rf.updateHeartBeat()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
