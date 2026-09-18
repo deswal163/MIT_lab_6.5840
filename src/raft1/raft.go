@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"6.5840/dlog"
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
@@ -44,6 +45,10 @@ type Raft struct {
 	state            int
 	lastHeartBeat    time.Time
 	electionDeadline time.Time
+	commitIndex      int
+	lastApplied      int
+	nextIndex        []int
+	matchIndex       []int
 	// logs
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
@@ -151,7 +156,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	rf.dlog(dlog.Vote, "<- S%d RequestVote(T=%d, lli=%d, llt=%d) [myT=%d, votedFor=%d]",
+		args.CandidateId, args.Term, args.LastLogIndex, args.LastLogTerm,
+		rf.CurrentTerm, rf.VotedFor)
+
 	if rf.CurrentTerm < args.Term {
+		rf.dlog(dlog.Term, "step down T=%d -> T=%d (RequestVote from S%d)", rf.CurrentTerm, args.Term, args.CandidateId)
 		rf.state = follower
 		rf.CurrentTerm = args.Term
 		rf.VotedFor = -1
@@ -159,7 +169,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.CurrentTerm
 
-	if args.Term < rf.CurrentTerm || (rf.VotedFor != -1 && rf.VotedFor != args.CandidateId) {
+	if args.Term < rf.CurrentTerm {
+		rf.dlog(dlog.Vote, "refused S%d: stale term (T=%d < myT=%d)", args.CandidateId, args.Term, rf.CurrentTerm)
+		reply.VoteGranted = false
+		return
+	}
+
+	if rf.VotedFor != -1 && rf.VotedFor != args.CandidateId {
+		rf.dlog(dlog.Vote, "refused S%d: already voted for S%d in T=%d", args.CandidateId, rf.VotedFor, rf.CurrentTerm)
 		reply.VoteGranted = false
 		return
 	}
@@ -168,6 +185,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.state = follower
 	reply.VoteGranted = true
 	rf.updateHeartBeat()
+	rf.dlog(dlog.Vote, "granted to S%d in T=%d", args.CandidateId, rf.CurrentTerm)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -229,8 +247,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = false
 
 	if args.Term < rf.CurrentTerm {
+		rf.dlog(dlog.Drop, "stale AE from S%d (T=%d < myT=%d)", args.LeaderId, args.Term, rf.CurrentTerm)
 		return
 	}
+
+	wasLeader := rf.state == leader
+	oldTerm := rf.CurrentTerm
 
 	rf.leaderId = args.LeaderId
 	rf.state = follower
@@ -239,6 +261,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
 		rf.VotedFor = -1
+		rf.dlog(dlog.Term, "step down T=%d -> T=%d (AE from S%d)", oldTerm, rf.CurrentTerm, args.LeaderId)
+	}
+	if wasLeader {
+		rf.dlog(dlog.Lead, "leader stepping down: AE from S%d at T=%d", args.LeaderId, args.Term)
 	}
 
 	reply.Term = rf.CurrentTerm
@@ -278,6 +304,8 @@ func (rf *Raft) sendHeartBeats() {
 				defer rf.mu.Unlock()
 
 				if reply.Term > rf.CurrentTerm {
+					rf.dlog(dlog.Term, "leader stepping down: HB reply T=%d > myT=%d (from S%d)",
+						reply.Term, rf.CurrentTerm, i)
 					rf.CurrentTerm = reply.Term
 					rf.state = follower
 					rf.VotedFor = -1
@@ -304,10 +332,17 @@ func (rf *Raft) sendHeartBeats() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	index := rf.commitIndex + 1
+	term := rf.CurrentTerm
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	isLeader := (rf.state == leader)
+
+	if !isLeader {
+		return index, term, false
+	}
 	// Your code here (3B).
 
 	return index, term, isLeader
@@ -333,22 +368,30 @@ func (rf *Raft) startElection(currentTerm, me int) {
 				Term:        currentTerm,
 				CandidateId: candidateId,
 			}
+			rf.dlog(dlog.Vote, "-> S%d RequestVote(T=%d)", i, currentTerm)
 
 			reply := RequestVoteReply{}
 
 			ok := rf.sendRequestVote(i, &args, &reply)
 			if !ok {
+				rf.dlog(dlog.Drop, "RequestVote -> S%d: rpc failed (network/dead)", i)
 				return
 			}
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
+			rf.dlog(dlog.Vote, "<- S%d reply T=%d granted=%v", i, reply.Term, reply.VoteGranted)
+
 			if rf.state != candidate || rf.CurrentTerm != savedCurrentTerm {
+				rf.dlog(dlog.Drop, "stale RequestVote reply from S%d (state=%d, T=%d, savedT=%d)",
+					i, rf.state, rf.CurrentTerm, savedCurrentTerm)
 				return
 			}
 
 			if reply.Term > rf.CurrentTerm {
+				rf.dlog(dlog.Term, "stepping down: vote reply T=%d > myT=%d (from S%d)",
+					reply.Term, rf.CurrentTerm, i)
 				rf.CurrentTerm = reply.Term
 				rf.state = follower
 				rf.VotedFor = -1
@@ -359,6 +402,8 @@ func (rf *Raft) startElection(currentTerm, me int) {
 				if votesReceived > len(rf.peers)/2 {
 					rf.state = leader
 					rf.leaderId = rf.me
+					rf.dlog(dlog.Lead, "won election with %d/%d votes at T=%d",
+						votesReceived, len(rf.peers), rf.CurrentTerm)
 					go rf.sendHeartBeats()
 				}
 			}
@@ -379,6 +424,9 @@ func (rf *Raft) ticker() {
 				rf.CurrentTerm++
 				rf.VotedFor = rf.me
 				rf.updateHeartBeat()
+
+				rf.dlog(dlog.Timr, "election timeout fired")
+				rf.dlog(dlog.Lead, "follower/candidate -> candidate, T=%d", rf.CurrentTerm)
 
 				currentTerm, me = rf.CurrentTerm, rf.me
 				electionTimeout = true
@@ -419,6 +467,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.dlog(dlog.Info, "started, T=%d, votedFor=%d", rf.CurrentTerm, rf.VotedFor)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
