@@ -57,6 +57,7 @@ const (
 	Ctrl Topic = "CTRL"
 
 	Test Topic = "TEST"
+	AE   Topic = "AE"
 )
 
 var (
