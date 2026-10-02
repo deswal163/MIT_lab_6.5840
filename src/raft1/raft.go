@@ -164,7 +164,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.CurrentTerm, rf.VotedFor)
 
 	reply.VoteGranted = false
-	reply.Term = rf.CurrentTerm
+	defer func() {
+		reply.Term = rf.CurrentTerm
+	}()
 
 	if args.Term < rf.CurrentTerm {
 		rf.dlog(dlog.Vote, "refused S%d: stale term (T=%d < myT=%d)", args.CandidateId, args.Term, rf.CurrentTerm)
@@ -184,7 +186,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if rf.log[len(rf.log)-1].Term > args.LastLogTerm {
-		rf.dlog(dlog.Drop, "refused S%d: logs terms didn't matched (argsLTerm=%v, cTerm=%v)", args.CandidateId, rf.log[args.LastLogIndex].Term, args.LastLogTerm)
+		rf.dlog(dlog.Drop, "refused S%d: stale term update (argsLTerm=%v, cTerm=%v)", args.CandidateId, rf.log[len(rf.log)-1].Term, args.LastLogTerm)
 		return
 	}
 
@@ -249,15 +251,19 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Term = rf.CurrentTerm
+	defer func() {
+		reply.Term = rf.CurrentTerm
+	}()
+
 	reply.Success = false
 
 	if args.Term < rf.CurrentTerm {
@@ -281,14 +287,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.dlog(dlog.Lead, "leader stepping down: AE from S%d at argsT=%d", args.LeaderId, args.Term)
 	}
 
-	if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.log)-1 < args.PrevLogIndex {
+		rf.dlog(dlog.Drop, "Logs behind the S%v (nLog=%v, argsPIndex=%v)", args.LeaderId, len(rf.log)-1, args.PrevLogIndex)
+		reply.ConflictIndex = len(rf.log) - 1
+		return
+	}
 
-		if len(rf.log)-1 < args.PrevLogIndex {
-			rf.dlog(dlog.Drop, "Logs behind the S%v (nLog=%v, argsPIndex=%v)", args.LeaderId, len(rf.log)-1, args.PrevLogIndex)
-		} else {
-			rf.dlog(dlog.Drop, "Log Term mismatch from S%v (pTerm=%v, argsPTerm=%v) at index %v",
-				args.LeaderId, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, args.PrevLogIndex)
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		rf.dlog(dlog.Drop, "Log Term mismatch from S%v (pTerm=%v, argsPTerm=%v) at index %v",
+			args.LeaderId, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, args.PrevLogIndex)
+
+		var i int
+		for i = args.PrevLogIndex - 1; i >= 0 && rf.log[i].Term == rf.log[i+1].Term; i-- {
 		}
+		reply.ConflictIndex = i
 		return
 	}
 
@@ -380,26 +392,33 @@ func (rf *Raft) broadcastAppendEntries() {
 				return
 			}
 
-			if !reply.Success || rf.CurrentTerm != rf.log[lastLogIndex].Term {
+			if !reply.Success {
 				rf.dlog(dlog.Drop, "<- S%v AE, (success=%v, cTerm=%v, lTerm=%v, lIndex=%v)",
 					peerID, reply.Success, rf.CurrentTerm, rf.log[lastLogIndex].Term, lastLogIndex)
 
-				rf.nextIndex[peerID] = max(rf.nextIndex[peerID]-1, 1)
+				if rf.nextIndex[peerID] == args.PrevLogIndex+1 {
+					rf.nextIndex[peerID] = max(1, reply.ConflictIndex)
+				}
 				return
 			}
 
 			rf.dlog(dlog.Info, "<- S%v AE, Log replicated update (mIndex=%v -> %v, nIndex=%v -> %v)",
 				peerID, rf.matchIndex[peerID], lastLogIndex, rf.nextIndex[peerID], lastLogIndex+1)
-			rf.matchIndex[peerID] = lastLogIndex
-			rf.nextIndex[peerID] = lastLogIndex + 1
 
-			if rf.commitIndex < rf.matchIndex[peerID] {
+			newMatch := args.PrevLogIndex + len(args.Entries)
+
+			if newMatch > rf.matchIndex[peerID] {
+				rf.matchIndex[peerID] = newMatch
+				rf.nextIndex[peerID] = newMatch + 1
+			}
+
+			if rf.commitIndex < rf.matchIndex[peerID] && rf.log[rf.matchIndex[peerID]].Term == rf.CurrentTerm {
 				matchedCount := 0
 				for otherPeer, _ := range rf.matchIndex {
 					if rf.matchIndex[otherPeer] >= rf.matchIndex[peerID] {
 						matchedCount += 1
 					}
-					if matchedCount >= len(rf.peers)/2 {
+					if matchedCount > len(rf.peers)/2 {
 						rf.dlog(dlog.Info, "entry (i=%v, count=%v) replicated updating cIndex(%v -> %v)",
 							rf.matchIndex[peerID], matchedCount, rf.commitIndex, rf.matchIndex[peerID])
 						rf.commitIndex = rf.matchIndex[peerID]
@@ -458,6 +477,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.CurrentTerm,
 		Command: command,
 	})
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+
 	go rf.broadcastAppendEntries()
 
 	return index, term, isLeader
@@ -523,7 +544,7 @@ func (rf *Raft) startElection(currentTerm, me int) {
 					for peerID, _ := range rf.peers {
 						rf.nextIndex[peerID] = len(rf.log)
 					}
-
+					rf.matchIndex[rf.me] = len(rf.log) - 1
 					rf.dlog(dlog.Lead, "won election with %d/%d votes at T=%d",
 						votesReceived, len(rf.peers), rf.CurrentTerm)
 					go rf.sendHeartBeats()
